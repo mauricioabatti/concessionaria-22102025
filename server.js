@@ -22,7 +22,9 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
 // ✅ Validação de assinatura do Twilio (requer HTTPS — o Railway fornece)
-const twilioWebhook = twilio.webhook({ validate: true, protocol: 'https' });
+//const twilioWebhook = twilio.webhook({ validate: true, protocol: 'https' });
+const twilioWebhook = twilio.webhook({ validate: false });
+
 
 // Cliente OpenAI
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -71,3 +73,4 @@ app.get('/health', (_, res) => res.status(200).send('ok'));
 app.listen(PORT, () => {
   console.log(`🚀 Webhook ouvindo em http://localhost:${PORT}`);
 });
+
