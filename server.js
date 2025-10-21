@@ -1,95 +1,157 @@
-// server.js
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
 import twilio from 'twilio';
 import OpenAI from 'openai';
 
+/**
+ * ==== Variáveis de ambiente ====
+ */
 const {
   PORT = 3000,
-  TWILIO_AUTH_TOKEN,        // no sandbox pode deixar sem validar; em produção ative a validação
+  TWILIO_AUTH_TOKEN,
   OPENAI_API_KEY,
-  WORKFLOW_ID               // EX: wf_68e675eed8308190b879e7bee93f77380b5a95a081872a01
+  WORKFLOW_ID,
 } = process.env;
 
 if (!OPENAI_API_KEY || !WORKFLOW_ID) {
-  console.error('❌ Defina OPENAI_API_KEY e WORKFLOW_ID nas variáveis de ambiente.');
+  console.error(
+    '❌ Faltam variáveis no .env: OPENAI_API_KEY e/ou WORKFLOW_ID.'
+  );
   process.exit(1);
 }
-
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-
-// Durante os testes no Twilio Sandbox é comum desativar a validação.
-// Em produção, mude para: twilio.webhook({ validate: true, protocol: 'https' })
-const twilioMiddleware = twilio.webhook({ validate: false });
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-function extractTextFromResponse(resp) {
-  // Respostas do /v1/responses com Workflow normalmente têm `output_text`
-  if (resp?.output_text) return String(resp.output_text).trim();
-
-  // fallback mais genérico: varre a estrutura de output
-  const parts = [];
-  if (Array.isArray(resp?.output)) {
-    for (const block of resp.output) {
-      if (Array.isArray(block.content)) {
-        for (const c of block.content) {
-          if (c?.type === 'output_text' && typeof c.text === 'string') {
-            parts.push(c.text);
-          } else if (typeof c?.text === 'string') {
-            parts.push(c.text);
-          }
-        }
-      }
-    }
-  }
-  return (parts.join('\n').trim()) || 'Desculpe, não consegui gerar uma resposta agora.';
+if (!TWILIO_AUTH_TOKEN) {
+  console.error(
+    '⚠️  TWILIO_AUTH_TOKEN não definido. A validação de webhook do Twilio não funcionará.'
+  );
 }
 
-app.post('/twilio/whatsapp', twilioMiddleware, async (req, res) => {
-  try {
-    const from = (req.body.From || '').trim();     // ex: 'whatsapp:+55...'
-    const userText = (req.body.Body || '').trim();
+/**
+ * ==== Inicialização ====
+ */
+const app = express();
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    console.log('📩 Mensagem recebida:', { from, userText });
+/**
+ * Twilio envia `application/x-www-form-urlencoded`
+ */
+app.use(bodyParser.urlencoded({ extended: false }));
+
+/**
+ * Middleware de verificação de assinatura do Twilio.
+ * Em produção (Railway) a URL é HTTPS, então podemos validar.
+ */
+const twilioWebhook =
+  TWILIO_AUTH_TOKEN
+    ? twilio.webhook({ validate: true, protocol: 'https' })
+    : // fallback sem validação (NÃO recomendado em prod)
+      (req, res, next) => next();
+
+/**
+ * Utilitário: cria um ID de conversa “limpo” (apenas [A-Za-z0-9_-])
+ * A OpenAI exige esse formato no `conversation.id`.
+ * Preferimos `WaId` (vem como apenas dígitos do Twilio) e,
+ * se faltar, sanitizamos o `From`.
+ */
+function buildConversationId(req) {
+  const raw =
+    req.body.WaId ||
+    String(req.body.From || '').replace(/^whatsapp:/, ''); // remove "whatsapp:"
+  const clean = raw.toString().replace(/[^\w-]/g, '_').slice(-64); // limita para evitar ids enormes
+  return `wa_${clean || 'unknown'}`;
+}
+
+/**
+ * ==== Endpoint do webhook do Twilio/WhatsApp ====
+ */
+app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
+  try {
+    const from = String(req.body.From || '');
+    const to = String(req.body.To || '');
+    const userText = String(req.body.Body || '').trim();
 
     if (!userText) {
       const twiml = new twilio.twiml.MessagingResponse();
-      twiml.message('Pode repetir a sua mensagem?');
+      twiml.message('Não entendi a mensagem (vazia). Pode tentar novamente?');
       return res.type('text/xml').send(twiml.toString());
     }
 
-    // CHAMADA AO WORKFLOW via /v1/responses — o model é o próprio WORKFLOW_ID
-    const response = await openai.responses.create({
-      model: WORKFLOW_ID,          // <<< ponto-chave: o ID do workflow vai aqui
-      // você pode passar só a string em `input`, mas manter o formato estruturado é ok:
-      input: [
-        { role: 'user', content: [{ type: 'input_text', text: userText }] }
-      ],
-      // manter estado por contato do WhatsApp
-      conversation: { id: `wa:${from}` }
+    // conversation.id válido para o Agent Builder
+    const conversationId = buildConversationId(req);
+
+    console.log('➡️  Mensagem IN:', {
+      from,
+      to,
+      waId: req.body.WaId,
+      body: userText,
+      conversationId,
     });
 
-    const replyText = extractTextFromResponse(response);
-    console.log('🤖 Resposta do Workflow:', replyText);
+    // ==== Chamada ao workflow do Agent Builder via Responses API ====
+    const oaResp = await openai.responses.create({
+      workflow_id: WORKFLOW_ID,
+      // Conversa “stateful” no lado da OpenAI, agrupada por esse ID:
+      conversation: { id: conversationId },
+
+      // Payload no formato do Responses API:
+      input: [
+        {
+          role: 'user',
+          content: [{ type: 'input_text', text: userText }],
+        },
+      ],
+
+      // Opcional: útil para debugar/filtrar no lado da OpenAI
+      metadata: { source: 'twilio-whatsapp' },
+    });
+
+    // Extrai o texto da resposta (duas formas possíveis)
+    let replyText = '';
+    if (oaResp?.output_text) {
+      replyText = oaResp.output_text;
+    } else if (
+      Array.isArray(oaResp?.output) &&
+      oaResp.output[0]?.content?.[0]?.text
+    ) {
+      replyText = oaResp.output[0].content[0].text;
+    }
+
+    if (!replyText) {
+      replyText =
+        'Tudo certo por aqui, mas não recebi uma resposta válida. Pode reformular a sua pergunta?';
+    }
+
+    console.log('⬅️  Workflow OK. Resposta:', replyText);
 
     const twiml = new twilio.twiml.MessagingResponse();
     twiml.message(replyText);
     return res.type('text/xml').send(twiml.toString());
   } catch (err) {
-    console.error('❌ ERRO Workflow:', err?.response?.data || err);
+    // Log detalhado no Railway para diagnóstico
+    console.error('❌ ERRO ao falar com o workflow:', {
+      status: err?.status,
+      message: err?.message,
+      data: err?.response?.data,
+    });
 
-    // Se quiser falhar explicitamente quando o Workflow não responder, mantenha essa mensagem curta:
+    const fallback =
+      'Tive um problema ao falar com o assistente. Tente novamente em instantes.';
+
     const twiml = new twilio.twiml.MessagingResponse();
-    twiml.message('Tive um problema ao falar com o assistente. Tente novamente em instantes.');
+    twiml.message(fallback);
     return res.type('text/xml').send(twiml.toString());
   }
 });
 
-app.get('/', (_, res) => res.send('OK - Twilio webhook (Workflow-only)'));
+/**
+ * ==== Endpoints auxiliares ====
+ */
+app.get('/', (_req, res) => res.send('OK - Twilio webhook ativo'));
+app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-app.listen(PORT, () => {
+/**
+ * ==== Sobe o servidor ====
+ */
+app.listen(Number(PORT), () => {
   console.log(`🚀 Webhook ouvindo em http://localhost:${PORT}`);
 });
