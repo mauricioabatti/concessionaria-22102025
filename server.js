@@ -5,40 +5,54 @@ import bodyParser from 'body-parser';
 import twilio from 'twilio';
 import OpenAI from 'openai';
 
-// ----- Env -----
 const {
   PORT = 3000,
   OPENAI_API_KEY,
-  WORKFLOW_ID,               // wf_...
-  FALLBACK_MODEL = 'gpt-4.1-mini', // usado só no fallback
+  WORKFLOW_ID,                 // wf_....
+  FALLBACK_MODEL = 'gpt-4.1-mini', // usado se os endpoints de workflow não estiverem disponíveis
 } = process.env;
 
 if (!OPENAI_API_KEY) {
   console.error('❌ Faltam variáveis: OPENAI_API_KEY.');
   process.exit(1);
 }
-if (!WORKFLOW_ID) {
-  console.warn('⚠️  WORKFLOW_ID não definido. Vou usar fallback com model:', FALLBACK_MODEL);
-}
 
-// ----- App -----
 const app = express();
 app.set('trust proxy', true);
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// (DEBUG) assinatura Twilio desativada enquanto testamos
+// Enquanto testamos, deixo sem validação de assinatura do Twilio:
 const twilioWebhook = twilio.webhook({ validate: false });
 
-// Cliente OpenAI (para o fallback)
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Sessões em memória
 const sessions = new Map();
 
-// ----------- helpers -----------
-async function callWorkflow(userText) {
-  const url = `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`;
-  const body = {
+// ---------- helpers ----------
+function extractText(data) {
+  return (
+    data?.output_text ||
+    data?.output?.[0]?.content?.[0]?.text ||
+    (typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 900)
+  );
+}
+
+/**
+ * Tenta executar o workflow em diferentes endpoints que existem hoje
+ * em tenants/versões diferentes da API. Se todos falharem, lança erro.
+ */
+async function tryRunWorkflow(userText) {
+  if (!WORKFLOW_ID) {
+    throw new Error('WORKFLOW_ID não definido');
+  }
+
+  const baseHeaders = {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
+
+  // payload padrão do Agent Builder (input_text)
+  const payload = {
     input: [
       {
         role: 'user',
@@ -47,31 +61,57 @@ async function callWorkflow(userText) {
     ],
   };
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
+  // Lista de tentativas (endpoint + body) — algumas contas têm somente uma das rotas.
+  const attempts = [
+    // 1) /v1/workflows/{id}/runs
+    {
+      url: `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`,
+      body: payload,
     },
-    body: JSON.stringify(body),
-  });
+    // 2) /v1/workflows/runs (workflow_id no corpo)
+    {
+      url: `https://api.openai.com/v1/workflows/runs`,
+      body: { workflow_id: WORKFLOW_ID, ...payload },
+    },
+    // 3) /v1/run_workflow (workflow_id no corpo) — algumas contas bêta usam esse
+    {
+      url: `https://api.openai.com/v1/run_workflow`,
+      body: { workflow_id: WORKFLOW_ID, ...payload },
+    },
+    // 4) Responses API com workflow_id — em algumas versões funciona,
+    //    mas geralmente exige model; deixo sem model só para tentativa:
+    {
+      url: `https://api.openai.com/v1/responses`,
+      body: { workflow_id: WORKFLOW_ID, ...payload },
+    },
+  ];
 
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Workflow HTTP ${res.status}: ${t}`);
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      const res = await fetch(attempt.url, {
+        method: 'POST',
+        headers: baseHeaders,
+        body: JSON.stringify(attempt.body),
+      });
+
+      if (res.ok) {
+        return res.json();
+      }
+
+      const text = await res.text();
+      errors.push({ urlTried: attempt.url, status: res.status, response: text });
+    } catch (e) {
+      errors.push({ urlTried: attempt.url, error: e?.message || String(e) });
+    }
   }
-  return res.json();
-}
 
-function extractText(data) {
-  // Tenta vários formatos comuns
-  return (
-    data?.output_text ||
-    data?.output?.[0]?.content?.[0]?.text ||
-    (typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 900)
-  );
+  // Se chegou aqui, nenhuma rota de workflow funcionou
+  const detail = JSON.stringify(errors, null, 2).slice(0, 1500);
+  throw new Error(`Nenhum endpoint de Workflow aceitou a chamada.\nTentativas:\n${detail}`);
 }
-// --------------------------------
+// -----------------------------
 
 app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   const from = req.body.From || '';
@@ -85,11 +125,23 @@ app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
     let replyText = '';
 
     if (WORKFLOW_ID) {
-      // ✅ Caminho principal: chama seu Workflow do Agent Builder
-      const data = await callWorkflow(userText);
-      replyText = extractText(data);
+      try {
+        const wfData = await tryRunWorkflow(userText);
+        replyText = extractText(wfData);
+      } catch (wfErr) {
+        console.warn('⚠️ Falhou workflow; caindo no fallback:', wfErr?.message || wfErr);
+        // 🔁 Fallback: Responses API com model explícito — responde normalmente
+        const resp = await openai.responses.create({
+          model: FALLBACK_MODEL,
+          input: userText,
+        });
+        replyText =
+          resp?.output_text ??
+          resp?.output?.[0]?.content?.[0]?.text ??
+          'Certo! Pode me contar um pouco mais?';
+      }
     } else {
-      // 🔁 Fallback: usa Responses API com model explícito
+      // Sem WORKFLOW_ID, vai direto no fallback
       const resp = await openai.responses.create({
         model: FALLBACK_MODEL,
         input: userText,
@@ -115,15 +167,9 @@ app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   } catch (err) {
     console.error('❌ ERRO no processamento:', err?.message || err);
     const twiml = new twilio.twiml.MessagingResponse();
-    const msg =
-      'DEBUG ERRO: ' +
-      (err?.message
-        ? err.message
-        : typeof err === 'string'
-        ? err
-        : JSON.stringify(err)
-      ).slice(0, 900);
-    twiml.message(msg);
+    twiml.message(
+      ('DEBUG ERRO: ' + (err?.message || JSON.stringify(err))).slice(0, 900)
+    );
     return res.type('text/xml').send(twiml.toString());
   }
 });
