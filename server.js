@@ -12,7 +12,7 @@ const {
 } = process.env;
 
 if (!TWILIO_AUTH_TOKEN || !OPENAI_API_KEY || !WORKFLOW_ID) {
-  console.error('❌ Configure TWILIO_AUTH_TOKEN, OPENAI_API_KEY e WORKFLOW_ID (.env local ou Variables no Railway).');
+  console.error('❌ Configure TWILIO_AUTH_TOKEN, OPENAI_API_KEY e WORKFLOW_ID (.env / Railway Variables).');
   process.exit(1);
 }
 
@@ -21,14 +21,14 @@ const app = express();
 // Twilio envia application/x-www-form-urlencoded
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Validação de assinatura do Twilio (requer HTTPS em produção – Railway fornece)
+// ✅ Validação de assinatura do Twilio (requer HTTPS — o Railway fornece)
 const twilioWebhook = twilio.webhook({ validate: true, protocol: 'https' });
 
 // Cliente OpenAI
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Sessão em memória (teste). Em produção use Redis ou DB.
-const sessions = new Map(); // key = From (usuário); value = array de mensagens
+// Sessão simples em memória (apenas para teste)
+const sessions = new Map(); // key = From; value = [{role, content}]
 
 app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   const from = req.body.From || '';
@@ -38,29 +38,22 @@ app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   hist.push({ role: 'user', content: userText });
 
   try {
-    // Chama o workflow do Agent Builder
-    const resp = await openai.responses.create({
+    // 🔹 Chama o seu WORKFLOW do Agent Builder (correto)
+    const run = await openai.workflows.runs.create({
       workflow_id: WORKFLOW_ID,
-      input: [
-        {
-          role: 'user',
-          content: [{ type: 'input_text', text: userText }]
-        }
-      ]
+      input: { input_as_text: userText }
     });
 
-    let replyText = '';
-    if (resp?.output_text) {
-      replyText = resp.output_text;
-    } else if (resp?.output?.[0]?.content?.[0]?.text) {
-      replyText = resp.output[0].content[0].text;
-    } else {
-      replyText = 'Certo! Pode me contar um pouco mais?';
-    }
+    // Tenta pegar a resposta em texto
+    const replyText =
+      run?.output_text ||
+      run?.final_output?.output_text ||
+      'Certo! Pode me contar um pouco mais?';
 
     hist.push({ role: 'assistant', content: replyText });
     sessions.set(from, hist);
 
+    // Resposta para o Twilio (TwiML)
     const twiml = new twilio.twiml.MessagingResponse();
     twiml.message(replyText);
     res.type('text/xml').send(twiml.toString());
@@ -73,6 +66,7 @@ app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
 });
 
 app.get('/', (_, res) => res.send('OK - Twilio webhook ativo'));
+app.get('/health', (_, res) => res.status(200).send('ok'));
 
 app.listen(PORT, () => {
   console.log(`🚀 Webhook ouvindo em http://localhost:${PORT}`);
