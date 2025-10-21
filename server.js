@@ -242,3 +242,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Webhook ouvindo em http://0.0.0.0:${PORT}`);
   console.log(`   DEBUG_LOG=${DEBUG_LOG} DEBUG_ECHO=${DEBUG_ECHO} FORCE_FALLBACK=${FORCE_FALLBACK}`);
 });
+
