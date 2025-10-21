@@ -8,16 +8,19 @@ import OpenAI from 'openai';
 const {
   PORT = 3000,
   OPENAI_API_KEY,
-  WORKFLOW_ID,                       // ex: wf_abc123...
-  WORKFLOW_MODEL = 'gpt-4.1-mini',   // **OBRIGATÓRIO** p/ /v1/responses + workflow_id no seu tenant
-  FALLBACK_MODEL = 'gpt-4.1-mini',   // usado se o workflow falhar
-  DEBUG_LOG = '0',                   // "1" para logs verbosos no console
-  DEBUG_ECHO = '0',                  // "1" para prefixar no Whats (WF✅/WF❌/FB✅)
-  FORCE_FALLBACK = '0',              // "1" para ignorar workflow e ir direto no fallback
+  WORKFLOW_ID,                    // ex.: wf_xxxxxx
+  FALLBACK_MODEL = 'gpt-4.1-mini',
+  DEBUG_LOG = '0',                // "1" => logs verbosos no console
+  DEBUG_ECHO = '0',               // "1" => prefixa WF✅/WF❌/FB✅ na resposta do Whats
+  FORCE_FALLBACK = '0',           // "1" => ignora workflow e usa fallback p/ testar
 } = process.env;
 
 if (!OPENAI_API_KEY) {
-  console.error('❌ Falta OPENAI_API_KEY (use chave de usuário `sk-...`, não `sk-proj-...`).');
+  console.error('❌ Falta OPENAI_API_KEY (use chave de usuário `sk-…`, não `sk-proj-…`).');
+  process.exit(1);
+}
+if (!WORKFLOW_ID) {
+  console.error('❌ Falta WORKFLOW_ID (wf_…).');
   process.exit(1);
 }
 
@@ -25,24 +28,22 @@ const app = express();
 app.set('trust proxy', true);
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Em homologação, desative a validação de assinatura do Twilio:
+// Em homologação, sem validar assinatura do Twilio:
 const twilioWebhook = twilio.webhook({ validate: false });
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const sessions = new Map();
+const log = (...args) => { if (DEBUG_LOG === '1') console.log(...args); };
 
-const log = (...a) => { if (DEBUG_LOG === '1') console.log(...a); };
+// ---------------- Helpers ----------------
 
-// -------- Helpers ------------------------------------------------------------
-
-/** Extrai texto independente do formato de retorno da API nova. */
 function extractText(any) {
   try {
     if (!any) return '';
     if (typeof any === 'string') return any;
 
+    // Novo formato
     if (any.output_text) return String(any.output_text);
-    // Estrutura comum em Responses API
     const c0 = any.output?.[0]?.content?.[0];
     if (c0?.text) return String(c0.text);
 
@@ -52,61 +53,94 @@ function extractText(any) {
   }
 }
 
-/** Constrói um conversation.id válido (apenas [a-zA-Z0-9_-]) a partir do número do Whats. */
 function conversationIdFor(from) {
-  // from vem como "whatsapp:+55..." — vamos extrair só dígitos e prefixar "wa_"
+  // alguns endpoints rejeitam chars especiais — manter só [a-zA-Z0-9_-]
   const digits = (from || '').replace(/\D+/g, '');
   return `wa_${digits || 'unknown'}`;
 }
 
-/** Chama o workflow via /v1/responses, com model + workflow_id + conversation.id */
-async function runWorkflowWithDiagnostics({ userText, conversationId }) {
-  if (!WORKFLOW_ID) {
-    throw new Error('WORKFLOW_ID não definido');
-  }
-  const url = 'https://api.openai.com/v1/responses';
+/**
+ * Faz a chamada ao workflow tentando diferentes endpoints.
+ * Ordem de tentativas (sem `model`):
+ *   1) POST /v1/workflows/{id}/runs
+ *   2) POST /v1/workflows/runs  { workflow_id }
+ *   3) POST /v1/run_workflow    { workflow_id }
+ * Retorna { data, prefix } ou lança erro consolidado.
+ */
+async function runWorkflowMultiEndpoints({ userText /*, conversationId */ }) {
+  const headers = {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
 
-  const body = {
-    model: WORKFLOW_MODEL,              // <- **ESSENCIAL** no seu tenant
-    workflow_id: WORKFLOW_ID,
-    // conversation é opcional, mas ajuda o Agent Builder a manter contexto
-    conversation: { id: conversationId },
+  // payload “oficial” de workflow (sem model; algumas contas não aceitam conversation)
+  const payload = {
     input: [
       {
         role: 'user',
         content: [{ type: 'input_text', text: userText }],
       },
     ],
+    // Se no seu tenant esse campo for aceito, você pode descomentar:
+    // conversation: { id: conversationId },
   };
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
+  const attempts = [
+    {
+      url: `https://api.openai.com/v1/workflows/${WORKFLOW_ID}/runs`,
+      body: payload,
+      label: 'runs-path',
     },
-    body: JSON.stringify(body),
-  });
+    {
+      url: `https://api.openai.com/v1/workflows/runs`,
+      body: { workflow_id: WORKFLOW_ID, ...payload },
+      label: 'runs-body',
+    },
+    {
+      url: `https://api.openai.com/v1/run_workflow`,
+      body: { workflow_id: WORKFLOW_ID, ...payload },
+      label: 'run_workflow',
+    },
+  ];
 
-  const reqId =
-    res.headers.get('x-request-id') ||
-    res.headers.get('openai-organization-request-id') ||
-    '';
+  const errors = [];
 
-  if (!res.ok) {
-    const errText = await res.text();
-    const prefix = DEBUG_ECHO === '1' ? `WF❌ [${res.status}${reqId ? `/${reqId}` : ''}] ` : '';
-    log('⚠️ Workflow FAIL', { status: res.status, reqId, errText });
-    throw new Error(`${prefix}${errText}`);
+  for (const att of attempts) {
+    try {
+      log(`→ Tentando workflow via ${att.label}: ${att.url}`);
+      const res = await fetch(att.url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(att.body),
+      });
+
+      const reqId =
+        res.headers.get('x-request-id') ||
+        res.headers.get('openai-organization-request-id') ||
+        '';
+
+      if (res.ok) {
+        const data = await res.json();
+        const prefix = DEBUG_ECHO === '1'
+          ? `WF✅[${att.label}/${res.status}${reqId ? `/${reqId}` : ''}] `
+          : '';
+        log('✅ Workflow OK', { label: att.label, status: res.status, reqId, preview: extractText(data) });
+        return { data, prefix };
+      } else {
+        const text = await res.text();
+        log('❗ FAIL', { label: att.label, status: res.status, body: text.slice(0, 500) });
+        errors.push({ label: att.label, status: res.status, body: text });
+      }
+    } catch (e) {
+      errors.push({ label: att.label, error: e?.message || String(e) });
+    }
   }
 
-  const data = await res.json();
-  const prefix = DEBUG_ECHO === '1' ? `WF✅ [${res.status}${reqId ? `/${reqId}` : ''}] ` : '';
-  log('✅ Workflow OK', { status: res.status, reqId, preview: extractText(data) });
-  return { data, prefix };
+  const consolidated = JSON.stringify(errors, null, 2).slice(0, 1500);
+  throw new Error(`Nenhum endpoint de Workflow aceitou a chamada.\n${consolidated}`);
 }
 
-/** Fallback para o modelo puro (Responses API) */
+/** Fallback simples (Responses API) */
 async function runFallback(userText) {
   const r = await openai.responses.create({
     model: FALLBACK_MODEL,
@@ -117,11 +151,11 @@ async function runFallback(userText) {
     r?.output?.[0]?.content?.[0]?.text ??
     'Certo! Pode me contar um pouco mais?';
   const prefix = DEBUG_ECHO === '1' ? 'FB✅ ' : '';
-  log('↩️ Fallback OK', { preview: txt.slice(0, 160) });
+  log('↩️ Fallback OK', { preview: txt.slice(0, 200) });
   return { text: txt, prefix };
 }
 
-// -----------------------------------------------------------------------------
+// ---------------- Handler ------------------
 
 app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   const from = req.body.From || '';
@@ -134,44 +168,41 @@ app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   hist.push({ role: 'user', content: userText });
 
   try {
-    let finalText = '';
-    let echoPrefix = '';
+    let reply = '';
+    let prefix = '';
 
     if (FORCE_FALLBACK === '1') {
       const fb = await runFallback(userText);
-      finalText = fb.text;
-      echoPrefix = fb.prefix;
+      reply = fb.text;
+      prefix = fb.prefix;
     } else {
       try {
-        const wf = await runWorkflowWithDiagnostics({
+        const wf = await runWorkflowMultiEndpoints({
           userText,
-          conversationId: convId,
+          // conversationId: convId, // descomente se seu tenant aceitar
         });
-        finalText = extractText(wf.data);
-        echoPrefix = wf.prefix;
+        reply = extractText(wf.data);
+        prefix = wf.prefix;
       } catch (wfErr) {
-        // Se o workflow falhar, cai no fallback
-        log('→ caindo no fallback. Motivo:', wfErr?.message || wfErr);
+        log('⚠️ Workflow falhou. Caindo no fallback. Motivo:', wfErr?.message || wfErr);
         const fb = await runFallback(userText);
-        finalText = fb.text;
-        echoPrefix = (DEBUG_ECHO === '1' ? (wfErr?.message?.slice(0, 240) + ' → ') : '') + fb.prefix + finalText;
-        // Se não quiser incluir a mensagem de erro no Whats, troque pela linha abaixo:
-        // echoPrefix = fb.prefix;
+        // Se quiser ver o erro do workflow no Whats, concatene:
+        // prefix = (DEBUG_ECHO === '1' ? `WF❌ ${String(wfErr?.message || wfErr).slice(0, 180)} → ` : '') + fb.prefix;
+        prefix = fb.prefix;
+        reply = fb.text;
       }
     }
 
-    if (!finalText || !finalText.trim()) {
-      finalText = 'Certo! Pode me contar um pouco mais?';
-    }
+    if (!reply?.trim()) reply = 'Certo! Pode me contar um pouco mais?';
 
-    hist.push({ role: 'assistant', content: finalText });
+    hist.push({ role: 'assistant', content: reply });
     sessions.set(from, hist);
 
     const twiml = new twilio.twiml.MessagingResponse();
-    twiml.message((DEBUG_ECHO === '1' ? echoPrefix : '') + finalText);
+    twiml.message((DEBUG_ECHO === '1' ? prefix : '') + reply);
     res.type('text/xml').send(twiml.toString());
 
-    log('📤 OUT:', { to: from, sent: finalText.slice(0, 160) });
+    log('📤 OUT:', { to: from, sent: reply.slice(0, 180) });
   } catch (err) {
     console.error('❌ ERRO no handler:', err?.message || err);
     const twiml = new twilio.twiml.MessagingResponse();
@@ -183,6 +214,7 @@ app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   }
 });
 
+// Health
 app.get('/', (_, res) => res.send('OK - Twilio webhook ativo'));
 app.get('/health', (_, res) => res.json({ ok: true }));
 
