@@ -8,21 +8,16 @@ import OpenAI from 'openai';
 const {
   PORT = 3000,
   OPENAI_API_KEY,
-  WORKFLOW_ID,                    // wf_...
-  FALLBACK_MODEL = 'gpt-4.1-mini',
-  DEBUG_LOG = '0',                // "1" para log detalhado no console (Railway)
-  DEBUG_ECHO = '0',               // "1" para ecoar no WhatsApp um prefixo com resultado/erro
-  FORCE_FALLBACK = '0',           // "1" ignora workflow e usa modelo fallback
+  WORKFLOW_ID,                       // ex: wf_abc123...
+  WORKFLOW_MODEL = 'gpt-4.1-mini',   // **OBRIGATÓRIO** p/ /v1/responses + workflow_id no seu tenant
+  FALLBACK_MODEL = 'gpt-4.1-mini',   // usado se o workflow falhar
+  DEBUG_LOG = '0',                   // "1" para logs verbosos no console
+  DEBUG_ECHO = '0',                  // "1" para prefixar no Whats (WF✅/WF❌/FB✅)
+  FORCE_FALLBACK = '0',              // "1" para ignorar workflow e ir direto no fallback
 } = process.env;
 
-const log = (...args) => {
-  if (String(DEBUG_LOG) === '1') {
-    console.log('[DBG]', ...args);
-  }
-};
-
 if (!OPENAI_API_KEY) {
-  console.error('❌ Faltam variáveis: OPENAI_API_KEY.');
+  console.error('❌ Falta OPENAI_API_KEY (use chave de usuário `sk-...`, não `sk-proj-...`).');
   process.exit(1);
 }
 
@@ -30,51 +25,51 @@ const app = express();
 app.set('trust proxy', true);
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Em produção, ative validate:true e configure TWILIO_AUTH_TOKEN
+// Em homologação, desative a validação de assinatura do Twilio:
 const twilioWebhook = twilio.webhook({ validate: false });
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
 const sessions = new Map();
 
-// ---------- helpers ----------
-function extractText(data) {
+const log = (...a) => { if (DEBUG_LOG === '1') console.log(...a); };
+
+// -------- Helpers ------------------------------------------------------------
+
+/** Extrai texto independente do formato de retorno da API nova. */
+function extractText(any) {
   try {
-    if (data?.output_text) return data.output_text;
-    if (Array.isArray(data?.output)) {
-      const first = data.output[0];
-      const text = first?.content?.[0]?.text;
-      if (text) return text;
-    }
-    return JSON.stringify(data).slice(0, 900);
-  } catch (e) {
-    return 'Não consegui interpretar a resposta do agente.';
+    if (!any) return '';
+    if (typeof any === 'string') return any;
+
+    if (any.output_text) return String(any.output_text);
+    // Estrutura comum em Responses API
+    const c0 = any.output?.[0]?.content?.[0];
+    if (c0?.text) return String(c0.text);
+
+    return JSON.stringify(any).slice(0, 900);
+  } catch {
+    return '';
   }
 }
 
-// sanitiza e cria um conversation.id válido (somente [A-Za-z0-9_-])
-function makeConversationId(reqBody) {
-  const fromDigits =
-    String(reqBody.WaId || '') ||
-    String(reqBody.From || '').replace(/\D/g, '') ||
-    String(reqBody.MessageSid || 'conv');
-
-  const cleaned = fromDigits.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
-  return cleaned || 'conv';
+/** Constrói um conversation.id válido (apenas [a-zA-Z0-9_-]) a partir do número do Whats. */
+function conversationIdFor(from) {
+  // from vem como "whatsapp:+55..." — vamos extrair só dígitos e prefixar "wa_"
+  const digits = (from || '').replace(/\D+/g, '');
+  return `wa_${digits || 'unknown'}`;
 }
 
-/**
- * Executa o workflow via Responses API (rota suportada para Agent Builder)
- * - Necessita 'workflow_id'
- * - Usa 'conversation.id' para manter contexto
- * Retorna { json, requestId, status }
- */
+/** Chama o workflow via /v1/responses, com model + workflow_id + conversation.id */
 async function runWorkflowWithDiagnostics({ userText, conversationId }) {
-  if (!WORKFLOW_ID) throw new Error('WORKFLOW_ID não definido');
+  if (!WORKFLOW_ID) {
+    throw new Error('WORKFLOW_ID não definido');
+  }
+  const url = 'https://api.openai.com/v1/responses';
 
-  const url = `https://api.openai.com/v1/responses`;
-  const payload = {
+  const body = {
+    model: WORKFLOW_MODEL,              // <- **ESSENCIAL** no seu tenant
     workflow_id: WORKFLOW_ID,
+    // conversation é opcional, mas ajuda o Agent Builder a manter contexto
     conversation: { id: conversationId },
     input: [
       {
@@ -84,130 +79,107 @@ async function runWorkflowWithDiagnostics({ userText, conversationId }) {
     ],
   };
 
-  log('→ [WF] POST', url, 'payload:', JSON.stringify(payload));
-
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
 
-  const reqId = res.headers.get('x-request-id') || res.headers.get('openai-request-id') || 'n/a';
-  const status = res.status;
+  const reqId =
+    res.headers.get('x-request-id') ||
+    res.headers.get('openai-organization-request-id') ||
+    '';
 
-  let bodyText;
-  try {
-    bodyText = await res.text();
-  } catch {
-    bodyText = '<no-body>';
-  }
-
-  log('← [WF] status:', status, 'request-id:', reqId);
   if (!res.ok) {
-    const shortErr = bodyText.slice(0, 800);
-    log('← [WF] ERROR body:', shortErr);
-    throw Object.assign(new Error(`Workflow HTTP ${status}`), {
-      status,
-      requestId: reqId,
-      body: shortErr,
-    });
+    const errText = await res.text();
+    const prefix = DEBUG_ECHO === '1' ? `WF❌ [${res.status}${reqId ? `/${reqId}` : ''}] ` : '';
+    log('⚠️ Workflow FAIL', { status: res.status, reqId, errText });
+    throw new Error(`${prefix}${errText}`);
   }
 
-  let json;
-  try {
-    json = JSON.parse(bodyText);
-  } catch {
-    json = { raw: bodyText };
-  }
-
-  log('← [WF] OK body(sample):', bodyText.slice(0, 800));
-  return { json, requestId: reqId, status };
+  const data = await res.json();
+  const prefix = DEBUG_ECHO === '1' ? `WF✅ [${res.status}${reqId ? `/${reqId}` : ''}] ` : '';
+  log('✅ Workflow OK', { status: res.status, reqId, preview: extractText(data) });
+  return { data, prefix };
 }
 
-/** chama fallback model explicitamente */
-async function runFallbackLLM(userText) {
-  const resp = await openai.responses.create({
+/** Fallback para o modelo puro (Responses API) */
+async function runFallback(userText) {
+  const r = await openai.responses.create({
     model: FALLBACK_MODEL,
     input: userText,
   });
-  return (
-    resp?.output_text ??
-    resp?.output?.[0]?.content?.[0]?.text ??
-    'Certo! Pode me contar um pouco mais?'
-  );
+  const txt =
+    r?.output_text ??
+    r?.output?.[0]?.content?.[0]?.text ??
+    'Certo! Pode me contar um pouco mais?';
+  const prefix = DEBUG_ECHO === '1' ? 'FB✅ ' : '';
+  log('↩️ Fallback OK', { preview: txt.slice(0, 160) });
+  return { text: txt, prefix };
 }
-// -----------------------------
+
+// -----------------------------------------------------------------------------
 
 app.post('/twilio/whatsapp', twilioWebhook, async (req, res) => {
   const from = req.body.From || '';
   const userText = (req.body.Body || '').trim();
-  const conversationId = makeConversationId(req.body);
+  const convId = conversationIdFor(from);
 
-  log('📩 RX', { from, waId: req.body.WaId, conversationId, text: userText });
+  log('📩 IN:', { from, userText, convId });
 
   const hist = sessions.get(from) ?? [];
   hist.push({ role: 'user', content: userText });
 
-  let replyText = '';
-  let debugPrefix = ''; // aparece no WhatsApp quando DEBUG_ECHO=1
-
   try {
+    let finalText = '';
+    let echoPrefix = '';
+
     if (FORCE_FALLBACK === '1') {
-      log('⤵️ FORCE_FALLBACK=1 → pulando workflow');
-      replyText = await runFallbackLLM(userText);
-      debugPrefix = 'FB✅ ';
-    } else if (WORKFLOW_ID) {
-      try {
-        const t0 = Date.now();
-        const { json, requestId, status } = await runWorkflowWithDiagnostics({
-          userText,
-          conversationId,
-        });
-        const dt = Date.now() - t0;
-        replyText = extractText(json);
-        debugPrefix = `WF✅ [${status}/${requestId} ${dt}ms] `;
-      } catch (wfErr) {
-        log('⚠️ WF FAIL →', wfErr?.message, 'reqId:', wfErr?.requestId, 'status:', wfErr?.status);
-        // se quiser ecoar um pedaço do erro no WhatsApp:
-        if (String(DEBUG_ECHO) === '1') {
-          const errFrag = (wfErr?.body || wfErr?.message || '').slice(0, 220);
-          debugPrefix = `WF❌ [${wfErr?.status || '?'} ${wfErr?.requestId || 'no-id'}] ${errFrag} → `;
-        }
-        // fallback
-        const fb = await runFallbackLLM(userText);
-        replyText = fb;
-        if (!debugPrefix) debugPrefix = 'FB✅ ';
-      }
+      const fb = await runFallback(userText);
+      finalText = fb.text;
+      echoPrefix = fb.prefix;
     } else {
-      log('ℹ️ Sem WORKFLOW_ID → fallback direto');
-      replyText = await runFallbackLLM(userText);
-      debugPrefix = 'FB✅ ';
+      try {
+        const wf = await runWorkflowWithDiagnostics({
+          userText,
+          conversationId: convId,
+        });
+        finalText = extractText(wf.data);
+        echoPrefix = wf.prefix;
+      } catch (wfErr) {
+        // Se o workflow falhar, cai no fallback
+        log('→ caindo no fallback. Motivo:', wfErr?.message || wfErr);
+        const fb = await runFallback(userText);
+        finalText = fb.text;
+        echoPrefix = (DEBUG_ECHO === '1' ? (wfErr?.message?.slice(0, 240) + ' → ') : '') + fb.prefix + finalText;
+        // Se não quiser incluir a mensagem de erro no Whats, troque pela linha abaixo:
+        // echoPrefix = fb.prefix;
+      }
     }
 
-    if (!replyText || !replyText.trim()) {
-      replyText = 'Certo! Pode me contar um pouco mais?';
+    if (!finalText || !finalText.trim()) {
+      finalText = 'Certo! Pode me contar um pouco mais?';
     }
 
-    hist.push({ role: 'assistant', content: replyText });
+    hist.push({ role: 'assistant', content: finalText });
     sessions.set(from, hist);
 
-    const outMsg = (String(DEBUG_ECHO) === '1') ? (debugPrefix + replyText) : replyText;
+    const twiml = new twilio.twiml.MessagingResponse();
+    twiml.message((DEBUG_ECHO === '1' ? echoPrefix : '') + finalText);
+    res.type('text/xml').send(twiml.toString());
 
-    log('📤 TX', { to: from, size: outMsg.length, preview: outMsg.slice(0, 200) });
-    const twiml = new twilio.twiml.MessagingResponse();
-    twiml.message(outMsg);
-    return res.type('text/xml').send(twiml.toString());
+    log('📤 OUT:', { to: from, sent: finalText.slice(0, 160) });
   } catch (err) {
-    console.error('❌ ERRO no processamento:', err?.message || err);
+    console.error('❌ ERRO no handler:', err?.message || err);
     const twiml = new twilio.twiml.MessagingResponse();
-    const txt = (String(DEBUG_ECHO) === '1')
-      ? ('ERR❌ ' + (err?.message || JSON.stringify(err))).slice(0, 900)
-      : 'Tive um problema agora. Pode repetir a última mensagem?';
-    twiml.message(txt);
-    return res.type('text/xml').send(twiml.toString());
+    const msg = (DEBUG_ECHO === '1'
+      ? `ERR❌ ${String(err?.message || err).slice(0, 900)}`
+      : 'Tive um probleminha agora 😅. Pode tentar novamente?');
+    twiml.message(msg);
+    res.type('text/xml').send(twiml.toString());
   }
 });
 
@@ -215,6 +187,6 @@ app.get('/', (_, res) => res.send('OK - Twilio webhook ativo'));
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
-  console.log(`🚀 Webhook ouvindo em http://localhost:${PORT}`);
-  log('DEBUG_LOG=', DEBUG_LOG, 'DEBUG_ECHO=', DEBUG_ECHO, 'FORCE_FALLBACK=', FORCE_FALLBACK);
+  console.log(`🚀 Webhook ouvindo em http://0.0.0.0:${PORT}`);
+  console.log(`   DEBUG_LOG=${DEBUG_LOG} DEBUG_ECHO=${DEBUG_ECHO} FORCE_FALLBACK=${FORCE_FALLBACK}`);
 });
